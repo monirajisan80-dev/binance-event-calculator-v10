@@ -1,0 +1,31 @@
+services:
+  # Persistent background worker: always on, no port binding, no disk needed
+  # (all state lives in Supabase PostgreSQL).
+  - type: worker
+    name: binance-event-bot
+    runtime: docker
+    plan: starter
+    autoDeploy: true
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: OWNER_ID
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: TG_API_ID
+        sync: false
+      - key: TG_API_HASH
+        sync: false
+      - key: TG_SESSION_STRING
+        sync: false
+      - key: DB_POOL_MAX
+        value: "5"
+  # Alternative: run as a Web Service instead (health check on /healthz).
+  # Note free web services sleep when idle, which stops Telegram polling.
+  # - type: web
+  #   name: binance-event-bot
+  #   runtime: docker
+  #   plan: starter
+  #   healthCheckPath: /healthz
+  #   envVars: (same as above; Render sets PORT automatically)
