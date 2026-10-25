@@ -8,18 +8,64 @@ robust than parsing DOM. A semaphore limits concurrency; a delay is applied betw
 import asyncio
 import logging
 import math
+import random
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from urllib.parse import urlsplit, parse_qsl
 from playwright.async_api import async_playwright, Browser, TimeoutError as PWTimeout
 from config import REQUEST_DELAY_SEC
+try:  # playwright-stealth >= 2.0
+    from playwright_stealth import Stealth
+    _STEALTH = Stealth()
+except Exception:  # package missing or old API: run without it rather than crash
+    _STEALTH = None
 from reward_caps import extract_reward_cap
 
 log = logging.getLogger("scraper")
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
+      "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36")
+VIEWPORTS = ((1920, 1080), (1536, 864), (1440, 900), (1366, 768))
+LAUNCH_ARGS = ["--disable-blink-features=AutomationControlled", "--no-sandbox",
+               "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+
+
+async def human_pause(lo: float = 0.6, hi: float = 1.8):
+    """Randomised human-like wait. Disabled when REQUEST_DELAY_SEC is 0 (tests)."""
+    if REQUEST_DELAY_SEC > 0:
+        await asyncio.sleep(random.uniform(lo, hi))
+
+
+async def human_wiggle(page):
+    """Minor mouse movement + small scroll, like a person looking at the page."""
+    if REQUEST_DELAY_SEC <= 0:
+        return
+    try:
+        vp = page.viewport_size or {"width": 1366, "height": 768}
+        await page.mouse.move(random.randint(100, vp["width"] - 100), random.randint(100, vp["height"] - 100),
+                              steps=random.randint(8, 20))
+        await page.mouse.wheel(0, random.randint(120, 480))
+        await asyncio.sleep(random.uniform(0.3, 0.9))
+        await page.mouse.wheel(0, -random.randint(60, 240))
+    except Exception:
+        log.debug("wiggle failed", exc_info=True)
+
+
+async def human_click(page, locator, timeout: int = 10000):
+    """Scroll the target into view, glide the mouse onto it, pause, then click."""
+    if REQUEST_DELAY_SEC > 0:
+        try:
+            await locator.scroll_into_view_if_needed(timeout=timeout)
+            box = await locator.bounding_box()
+            if box:
+                await page.mouse.move(box["x"] + box["width"] * random.uniform(0.3, 0.7),
+                                      box["y"] + box["height"] * random.uniform(0.3, 0.7),
+                                      steps=random.randint(10, 25))
+            await asyncio.sleep(random.uniform(0.15, 0.6))
+        except Exception:
+            log.debug("human approach failed", exc_info=True)
+    await locator.click(timeout=timeout)
 
 MONTHS = (r"Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?"
           r"|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?")
@@ -28,6 +74,15 @@ DATE_RE = re.compile(rf"(\d{{4}}[-/.]\d{{1,2}}[-/.]\d{{1,2}}(?:[ T]+\d{{1,2}}:\d
 PAIR_RE = re.compile(r"\b([A-Z0-9]{2,15})/(USDT|USDC|FDUSD|BTC|BNB|ETH|TRY|EUR)\b")
 POOL_RE = re.compile(r"([\d,]+(?:\.\d+)?)\s*(BNB|USDT|USDC|FDUSD)\b[^.\n]{0,40}(?:pool|reward|prize)", re.I)
 MINVOL_RE = re.compile(r"(?:minimum|at least)[^$\n]{0,60}\$?\s*([\d,]+(?:\.\d+)?)\s*(?:USD|USDT)?", re.I)
+PRIZE_RE = re.compile(r"(?:total\s+)?prize\s+pool(?:\s+of)?[:\s]*(?:up\s+to\s+)?(?:a\s+total\s+of\s+)?([\d,]+(?:\.\d+)?)\s*(BNB|USDT|USDC|FDUSD)\b"
+                      r"|share\s+(?:a\s+)?(?:total\s+)?(?:prize\s+pool\s+of\s+)?(?:up\s+to\s+)?([\d,]+(?:\.\d+)?)\s*(BNB|USDT|USDC|FDUSD)\b", re.I)
+TIER_RE = re.compile(r"^\s*(?:rank(?:ing)?\s*|top\s*)?#?(\d{1,6})(?:st|nd|rd|th)?"
+                     r"(?:\s*(?:-|–|—|to|~)\s*#?(\d{1,6})(?:st|nd|rd|th)?)?\b[^\n]{0,80}?"
+                     r"([\d,]+(?:\.\d+)?)\s*(BNB|USDT|USDC|FDUSD)\b", re.I)
+STAY_HERE_RE = re.compile(r"^\s*stay\s+here\s*$", re.I)
+JOIN_RE = re.compile(r"^\s*join\s+now\s*$", re.I)
+MAIN_POOL_RE = re.compile(r"main\s+reward\s+pool", re.I)
+NAME_KEYS = ("nickName", "nickname", "userName", "username", "displayName", "maskedName", "name", "uid", "userId")
 LINK_RE = re.compile(r"https?://(?:www\.)?binance\.com/[^\s)\]]*(?:support/announcement|activity|campaign)[^\s)\]]*")
 
 
@@ -65,7 +120,7 @@ def _to_float(v) -> float | None:
 
 
 def parse_period(text: str) -> tuple[int | None, int | None]:
-    m = re.search(r"(?:Promotion|Activity|Campaign|Event|Tournament)\s+Period[:\s]*(.{0,200})", text or "", re.I | re.S)
+    m = re.search(r"(?:Promotion|Activity|Campaign|Event|Tournament|Statistical|Statistics|Competition)\s+Period[:\s]*(.{0,200})", text or "", re.I | re.S)
     if not m:
         return None, None
     stamps = [t for t in (_parse_date(d[0] or d[1]) for d in DATE_RE.findall(m.group(1))) if t]
@@ -76,7 +131,36 @@ def parse_period(text: str) -> tuple[int | None, int | None]:
     return start, end
 
 
-def harvest_rows(obj, rows: dict, depth: int = 0):
+def parse_reward_tiers(text: str) -> list[dict]:
+    """Tier-wise reward breakdown, e.g. "1st  40 BNB" / "Rank 11 - 50  2 BNB each"."""
+    tiers, seen = [], set()
+    for line in (text or "").splitlines():
+        if DATE_RE.search(line) or re.search(r"period|minimum|at least|\(utc\)", line, re.I):
+            continue
+        m = TIER_RE.match(line)
+        if not m:
+            continue
+        lo = int(m.group(1)); hi = int(m.group(2)) if m.group(2) else lo
+        if re.match(r"^\s*top\b", line, re.I) and not m.group(2):
+            lo, hi = 1, int(m.group(1))
+        amount = _to_float(m.group(3))
+        if not amount or lo < 1 or hi < lo or (lo, hi) in seen:
+            continue
+        seen.add((lo, hi))
+        tiers.append({"rank_from": lo, "rank_to": hi, "reward": amount,
+                      "token": m.group(4).upper(), "label": " ".join(line.split())[:120]})
+    return sorted(tiers, key=lambda t: t["rank_from"])
+
+
+def _username(item: dict):
+    for key in NAME_KEYS:
+        value = item.get(key)
+        if isinstance(value, (str, int)) and not isinstance(value, bool) and str(value).strip():
+            return str(value).strip()[:100]
+    return None
+
+
+def harvest_rows(obj, rows: dict, depth: int = 0, names: dict | None = None):
     """Collect {rank: volume} from any nested JSON. Never raises on odd shapes."""
     if depth > 12:
         return
@@ -89,11 +173,13 @@ def harvest_rows(obj, rows: dict, depth: int = 0):
                 r, v = _to_float(rk), _to_float(vol)
                 if r is not None and v is not None and r >= 1 and r == int(r):
                     rows[int(r)] = v
+                    if names is not None:
+                        names[int(r)] = _username(it)
                     continue
-            harvest_rows(it, rows, depth + 1)
+            harvest_rows(it, rows, depth + 1, names)
     elif isinstance(obj, dict):
         for v in obj.values():
-            harvest_rows(v, rows, depth + 1)
+            harvest_rows(v, rows, depth + 1, names)
 
 
 def invalid_ranked_rows(obj, depth=0):
@@ -140,6 +226,8 @@ class LeaderboardResult:
     ranked_participants: int
     total_participants: int | None = None
     pages: int = 1
+    # Every captured participant, rank 1 -> final: (rank, username, volume).
+    participants: list[tuple[int, str | None, float]] = field(default_factory=list)
 
 
 def _count(value):
@@ -225,7 +313,20 @@ class Scraper:
     async def start(self):
         self._pw = await async_playwright().start()
         self.browser = await self._pw.chromium.launch(
-            headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+            headless=True, args=LAUNCH_ARGS, ignore_default_args=["--enable-automation"])
+
+    async def _new_context(self):
+        w, h = random.choice(VIEWPORTS)
+        ctx = await self.browser.new_context(
+            user_agent=UA, locale="en-US", viewport={"width": w, "height": h},
+            screen={"width": w, "height": h}, device_scale_factor=1, timezone_id="UTC",
+            extra_http_headers={"Accept-Language": "en-US,en;q=0.9"})
+        if _STEALTH is not None:
+            try:  # masks navigator.webdriver, plugins, languages, WebGL vendor, etc.
+                await _STEALTH.apply_stealth_async(ctx)
+            except Exception:
+                log.warning("playwright-stealth could not be applied", exc_info=True)
+        return ctx
 
     async def stop(self):
         for closer in (self.browser and self.browser.close, self._pw and self._pw.stop):
@@ -250,24 +351,103 @@ class Scraper:
         except Exception:
             log.debug("context close failed", exc_info=True)
 
+    @staticmethod
+    def _stay_here(page):
+        return page.get_by_role("button", name=STAY_HERE_RE).or_(page.get_by_text(STAY_HERE_RE)).first
+
+    async def _install_popup_guard(self, page):
+        """Auto-dismiss the "View on Binance App" overlay (Stay Here / Go to App / Download).
+
+        Never clicks "Go to App" or "Download" — that would leave the web view.
+        Playwright runs the handler before any action whenever the overlay is visible.
+        """
+        async def handler(*_):
+            try:
+                await self._stay_here(page).click(timeout=3000)
+            except Exception:
+                log.debug("Stay Here click failed", exc_info=True)
+        try:
+            await page.add_locator_handler(self._stay_here(page), handler, no_wait_after=True)
+        except Exception:
+            log.debug("locator handler unsupported", exc_info=True)
+
+    async def _dismiss_app_popup(self, page, wait_ms: int = 2500):
+        """Explicit check right after load: the overlay appears immediately on open."""
+        btn = self._stay_here(page)
+        try:
+            await btn.wait_for(state="visible", timeout=wait_ms)
+        except PWTimeout:
+            return False
+        except Exception:
+            return False
+        try:
+            await btn.click(timeout=5000)
+            await btn.wait_for(state="hidden", timeout=5000)
+        except Exception:
+            log.debug("Stay Here dismissal incomplete", exc_info=True)
+        return True
+
+    async def _join_now_url(self, page) -> str | None:
+        """Resolve where [Join Now] leads: its href, or the page/tab it opens when clicked."""
+        btn = page.get_by_role("link", name=JOIN_RE).or_(page.get_by_role("button", name=JOIN_RE)) \
+                  .or_(page.get_by_text(JOIN_RE)).first
+        try:
+            if await btn.count() == 0:
+                return None
+            href = await btn.evaluate("e => (e.closest('a') || e).href || null")
+            if isinstance(href, str) and href.startswith("http"):
+                return href
+            before = page.url
+            try:
+                async with page.context.expect_page(timeout=8000) as new:
+                    await human_click(page, btn, timeout=8000)
+                target = await new.value
+                await target.wait_for_load_state("domcontentloaded", timeout=30000)
+                url = target.url
+                await target.close()
+                return url
+            except PWTimeout:
+                try:
+                    await page.wait_for_url(lambda u: u != before, timeout=10000)
+                except PWTimeout:
+                    return None
+                return page.url
+        except Exception:
+            log.debug("Join Now resolution failed", exc_info=True)
+            return None
+
     async def _page_text(self, url: str) -> tuple[str, list[str]]:
         await self._ensure()
         async with self.sem:
-            ctx = await self.browser.new_context(user_agent=UA, locale="en-US")
+            ctx = await self._new_context()
             try:
                 page = await ctx.new_page()
+                await self._install_popup_guard(page)
                 await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+                await self._dismiss_app_popup(page)
                 try:
                     await page.wait_for_load_state("networkidle", timeout=10000)
                 except PWTimeout:
                     pass  # Binance keeps polling; DOM content is enough
                 await page.wait_for_timeout(1500)
+                await human_pause(1.5, 3.5)
+                await human_wiggle(page)
                 text = await page.inner_text("body", timeout=15000)
+                try:  # put the article heading first so it wins title detection
+                    h1 = (await page.locator("h1").first.inner_text(timeout=3000)).strip()
+                    if h1:
+                        text = h1 + "\n" + (text or "")
+                except Exception:
+                    pass
                 try:
                     hrefs = await page.eval_on_selector_all("a[href]", "els => els.map(e => e.href)")
                 except Exception:
                     hrefs = []
-                return text or "", [h for h in hrefs if isinstance(h, str)]
+                hrefs = [h for h in hrefs if isinstance(h, str)]
+                join = await self._join_now_url(page)
+                if join and is_binance_url(join):
+                    hrefs.insert(0, "JOIN:" + join)
+                return text or "", hrefs
             finally:
                 await self._close_ctx(ctx)
                 await asyncio.sleep(REQUEST_DELAY_SEC)
@@ -278,7 +458,7 @@ class Scraper:
         text, hrefs = await self._page_text(url)
         lines = [l.strip() for l in text.splitlines() if l.strip()]
         title = next((l for l in lines if len(l) > 15 and any(
-            k in l.lower() for k in ("tournament", "trade", "share", "campaign", "promotion", "earn"))), lines[0] if lines else url)
+            k in l.lower() for k in ("tournament", "season", "competition", "trade", "share", "campaign", "promotion", "earn"))), lines[0] if lines else url)
 
         if not lines:
             raise ValueError("Announcement page was empty or blocked.")
@@ -286,6 +466,10 @@ class Scraper:
 
         pairs = sorted({f"{a}/{b}" for a, b in PAIR_RE.findall(text)})
         pools = [(v, t.upper()) for a, t in POOL_RE.findall(text) if (v := _to_float(a))]
+        for m in PRIZE_RE.finditer(text):
+            amount, tok = (m.group(1), m.group(2)) if m.group(1) else (m.group(3), m.group(4))
+            if (v := _to_float(amount)):
+                pools.append((v, tok.upper()))
         total_pool, token = max(pools) if pools else (None, "BNB")
         mv = MINVOL_RE.search(text)
         min_volume = _to_float(mv.group(1)) if mv else None
@@ -294,12 +478,15 @@ class Scraper:
         rules = "\n".join(lines[rules_idx:rules_idx + 6]) if rules_idx is not None else ""
 
         reward_cap, reward_cap_token = extract_reward_cap(text, token)
-        landing = next((h for h in hrefs if "/activity/" in h or "/campaign/" in h or "leaderboard" in h.lower()), None)
+        join = next((h[5:] for h in hrefs if h.startswith("JOIN:")), None)
+        hrefs = [h for h in hrefs if not h.startswith("JOIN:")]
+        landing = join or next((h for h in hrefs if "/activity/" in h or "/campaign/" in h or "leaderboard" in h.lower()), None)
         return {
             "url": url, "title": title[:200], "start_ts": start_ts, "end_ts": end_ts,
             "pairs": pairs, "rules": rules[:1500], "min_volume": min_volume,
             "total_pool": total_pool, "remaining_pool": None, "pool_token": token,
             "fixed_slots": [], "leaderboard_url": landing,
+            "reward_tiers": parse_reward_tiers(text),
             "reward_cap": reward_cap, "reward_cap_token": reward_cap_token,
         }
 
@@ -312,6 +499,7 @@ class Scraper:
         """
         await self._ensure()
         rows: dict[int, float] = {}
+        names: dict[int, str | None] = {}
         metadata = {}
         total_joined = None
         revision = 0
@@ -332,8 +520,8 @@ class Scraper:
                 payload = await resp.json()
                 if source_identity is not None and identity != source_identity:
                     return
-                found = {}
-                harvest_rows(payload, found)
+                found, found_names = {}, {}
+                harvest_rows(payload, found, names=found_names)
                 meta = pagination_metadata(payload)
                 if not found and not meta:
                     return
@@ -355,6 +543,7 @@ class Scraper:
                 signature = (meta.get("page"), hash(tuple(sorted(found.items()))))
                 if signature != last_signature:
                     rows.update(found)
+                    names.update(found_names)
                     metadata.update(meta)
                     last_signature = signature
                     revision += 1
@@ -379,19 +568,56 @@ class Scraper:
                 raise IncompleteLeaderboard("Leaderboard page did not advance; snapshot not saved") from exc
 
         async with self.sem:
-            ctx = await self.browser.new_context(user_agent=UA, locale="en-US")
+            ctx = await self._new_context()
             page = None
             try:
                 page = await ctx.new_page()
                 page.on("response", on_response)
+                await self._install_popup_guard(page)
                 await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                await wait_advance(0)
+                # Mobile overlay "View on Binance App": always choose Stay Here.
+                await self._dismiss_app_popup(page)
+                await human_pause(1.5, 3.5)
+                await human_wiggle(page)
+                tab = page.get_by_role("tab", name=MAIN_POOL_RE).or_(page.get_by_text(MAIN_POOL_RE)).first
+                has_tab = False
+                try:
+                    await tab.wait_for(state="visible", timeout=8000)
+                    has_tab = True
+                except Exception:
+                    pass
+                if has_tab:
+                    try:
+                        await page.wait_for_load_state("networkidle", timeout=8000)
+                    except PWTimeout:
+                        pass
+                    # Discard whatever the default tab loaded; the snapshot is Main Reward Pool only.
+                    rows.clear(); names.clear(); metadata.clear()
+                    source_identity = last_signature = total_joined = capture_error = None
+                    expected_page = 1
+                    previous = revision
+                    await human_click(page, tab)
+                    try:
+                        await wait_advance(previous)
+                    except IncompleteLeaderboard:
+                        if not rows:  # tab was already selected and fired no new request
+                            await page.reload(wait_until="domcontentloaded", timeout=60000)
+                            await self._dismiss_app_popup(page)
+                            previous = revision
+                            await human_click(page, tab)
+                            await wait_advance(previous)
+                        else:
+                            raise
+                else:
+                    await wait_advance(0)
                 pages = 1
                 seen = {last_signature}
                 while True:
                     # Let loading/disabled states settle AFTER response parsing.
                     await asyncio.sleep(max(REQUEST_DELAY_SEC, 0.1))
-                    nxt = page.locator("button[aria-label*='next' i], .bn-pagination-next, li[title='Next Page']").first
+                    await human_pause(0.4, 1.4)
+                    nxt = page.locator("button[aria-label*='next' i], [role='button'][aria-label*='next' i], "
+                                       ".bn-pagination-next, li[title='Next Page'], [data-testid*='next' i]").first
                     exists = await nxt.count() > 0
                     disabled = exists and (not await nxt.is_enabled() or
                         await nxt.get_attribute("aria-disabled") == "true" or
@@ -420,7 +646,8 @@ class Scraper:
                     previous = revision
                     old_page = metadata.get("page")
                     expected_page = pages + 1
-                    await nxt.click(timeout=10000)
+                    await human_wiggle(page) if random.random() < 0.15 else None
+                    await human_click(page, nxt)
                     await wait_advance(previous)
                     if last_signature in seen:
                         raise IncompleteLeaderboard("Repeated leaderboard page; snapshot not saved")
@@ -429,9 +656,13 @@ class Scraper:
                         raise IncompleteLeaderboard("Leaderboard skipped or repeated a page")
                     seen.add(last_signature)
                     pages += 1
+                ranks = sorted(rows)
+                if ranks and ranks != list(range(1, len(ranks) + 1)):
+                    log.warning("Leaderboard source has rank gaps (%d rows, max rank %d)", len(ranks), ranks[-1])
                 return LeaderboardResult(
-                    volumes=[v for r, v in sorted(rows.items()) if r > skip_top],
-                    ranked_participants=len(rows), total_participants=total_joined, pages=pages)
+                    volumes=[rows[r] for r in ranks if r > skip_top],
+                    ranked_participants=len(rows), total_participants=total_joined, pages=pages,
+                    participants=[(r, names.get(r), rows[r]) for r in ranks])
             finally:
                 if page is not None:
                     page.remove_listener("response", on_response)

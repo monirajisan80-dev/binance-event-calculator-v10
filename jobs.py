@@ -31,7 +31,8 @@ async def refresh_event(ev: dict):
         stats.update(total_participants=result.total_participants,
                      ranked_participants=result.ranked_participants,
                      leaderboard_pages=result.pages)
-        if not await db.update_stats(eid, stats, current["settings_version"]):
+        if not await db.update_stats(eid, stats, current["settings_version"],
+                                    participants=result.participants):
             raise RuntimeError("Event settings changed during scraping; previous snapshot retained. Retry refresh.")
         return True
 

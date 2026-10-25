@@ -54,6 +54,15 @@ ALTER TABLE events ADD COLUMN IF NOT EXISTS reward_cap DOUBLE PRECISION;
 ALTER TABLE events ADD COLUMN IF NOT EXISTS reward_cap_token TEXT;
 ALTER TABLE events ADD COLUMN IF NOT EXISTS settings_version INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE events ADD COLUMN IF NOT EXISTS stats_version INTEGER;
+ALTER TABLE events ADD COLUMN IF NOT EXISTS reward_tiers TEXT DEFAULT '[]';
+CREATE TABLE IF NOT EXISTS leaderboard_entries (
+  event_id BIGINT NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+  rank INTEGER NOT NULL CHECK(rank >= 1),
+  username TEXT,
+  volume DOUBLE PRECISION NOT NULL,
+  scraped_at BIGINT NOT NULL,
+  PRIMARY KEY (event_id, rank)
+);
 """
 
 _INIT_LOCK_KEY = 815_042_201  # advisory lock so two instances never migrate at once
@@ -226,13 +235,13 @@ class DB:
     async def upsert_event(self, ev: dict) -> int:
         e = {"reward_cap": None, "reward_cap_token": None, "start_ts": None, "end_ts": None, "rules": "",
              "min_volume": None, "total_pool": None, "remaining_pool": None, "pool_token": "BNB",
-             "leaderboard_url": None, "title": None, **ev}
+             "leaderboard_url": None, "title": None, "reward_tiers": [], **ev}
         f = lambda v: None if v is None else float(v)
         i = lambda v: None if v is None else int(v)
         return await self.pool.fetchval("""
           INSERT INTO events(url,title,start_ts,end_ts,pairs,rules,min_volume,total_pool,remaining_pool,
-                             pool_token,fixed_slots,leaderboard_url,reward_cap,reward_cap_token,created_at)
-          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+                             pool_token,fixed_slots,leaderboard_url,reward_cap,reward_cap_token,created_at,reward_tiers)
+          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
           ON CONFLICT(url) DO UPDATE SET title=excluded.title,start_ts=excluded.start_ts,end_ts=excluded.end_ts,
             pairs=excluded.pairs,rules=excluded.rules,total_pool=COALESCE(excluded.total_pool, events.total_pool),
             remaining_pool=COALESCE(excluded.remaining_pool, events.remaining_pool),pool_token=excluded.pool_token,
@@ -240,12 +249,13 @@ class DB:
             min_volume=COALESCE(excluded.min_volume, events.min_volume),
             leaderboard_url=COALESCE(excluded.leaderboard_url, events.leaderboard_url),
             reward_cap=excluded.reward_cap,reward_cap_token=excluded.reward_cap_token,
+            reward_tiers=CASE WHEN excluded.reward_tiers IN ('[]','') THEN events.reward_tiers ELSE excluded.reward_tiers END,
             settings_version=events.settings_version+1
           RETURNING id
         """, e["url"], e["title"], i(e["start_ts"]), i(e["end_ts"]), json.dumps(e.get("pairs", [])),
             e["rules"], f(e["min_volume"]), f(e["total_pool"]), f(e["remaining_pool"]), e["pool_token"],
             json.dumps(e.get("fixed_slots", [])), e["leaderboard_url"], f(e["reward_cap"]),
-            e["reward_cap_token"], _now())
+            e["reward_cap_token"], _now(), json.dumps(e.get("reward_tiers") or []))
 
     async def list_events(self, live_only=False):
         q = "SELECT * FROM events"
@@ -260,12 +270,29 @@ class DB:
         r = await self.pool.fetchrow("SELECT * FROM events WHERE id=$1", int(eid))
         return self._event(r) if r else None
 
-    async def update_stats(self, eid: int, stats: dict, expected_version=None):
-        status = await self.pool.execute("""UPDATE events SET last_stats=$1, last_scraped=$2,
-            stats_version=settings_version WHERE id=$3
-            AND ($4::integer IS NULL OR settings_version=$4::integer)""",
-            json.dumps(stats), _now(), int(eid), expected_version)
-        return _rowcount(status) == 1
+    async def update_stats(self, eid: int, stats: dict, expected_version=None, participants=None):
+        """Stats + full participant list are replaced in ONE transaction: readers see the
+        previous complete snapshot or the new complete one, never a mix."""
+        now = _now()
+        async with self.pool.acquire() as conn, conn.transaction():
+            status = await conn.execute("""UPDATE events SET last_stats=$1, last_scraped=$2,
+                stats_version=settings_version WHERE id=$3
+                AND ($4::integer IS NULL OR settings_version=$4::integer)""",
+                json.dumps(stats), now, int(eid), expected_version)
+            if _rowcount(status) != 1:
+                return False
+            if participants is not None:
+                await conn.execute("DELETE FROM leaderboard_entries WHERE event_id=$1", int(eid))
+                if participants:
+                    await conn.copy_records_to_table(
+                        "leaderboard_entries", columns=["event_id", "rank", "username", "volume", "scraped_at"],
+                        records=[(int(eid), int(r), u, float(v), now) for r, u, v in participants])
+            return True
+
+    async def leaderboard(self, eid: int, limit: int | None = None, offset: int = 0):
+        return [dict(r) for r in await self.pool.fetch(
+            "SELECT rank, username, volume, scraped_at FROM leaderboard_entries WHERE event_id=$1 "
+            "ORDER BY rank LIMIT $2 OFFSET $3", int(eid), limit, int(offset))]
 
     async def set_field(self, eid: int, field: str, value):
         allowed = {"leaderboard_url", "remaining_pool", "total_pool", "min_volume"}

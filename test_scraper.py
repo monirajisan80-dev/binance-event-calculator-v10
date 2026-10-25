@@ -353,3 +353,85 @@ def test_interception_and_terminal_integrity(mode, monkeypatch):
         run(flow())
     finally:
         srv.shutdown();srv.server_close()
+
+
+# ---------- end-to-end journey: Stay Here popup, Main Reward Pool tab, usernames ----------
+def test_season8_announcement_title_pool_period_tiers_and_join_now():
+    sc = S.Scraper()
+    sc._page_text = AsyncMock(return_value=(
+        "Spot Trading Tournament Season 8\nMenu\nTotal Prize Pool: 400 BNB\n"
+        "Promotion Period: 2026-10-20 00:00 (UTC) to 2026-11-03 23:59 (UTC)\n"
+        "Rank\tReward\n1st\t40 BNB\n2nd - 10th\t10 BNB\n11 - 100\t1 BNB each\n",
+        ["JOIN:https://www.binance.com/en/activity/trading-competition/season8",
+         "https://www.binance.com/en/activity/other"]))
+    ev = run(sc.scrape_announcement("https://www.binance.com/en/support/announcement/x"))
+    assert ev["title"] == "Spot Trading Tournament Season 8"
+    assert (ev["total_pool"], ev["pool_token"]) == (400, "BNB")
+    assert (ev["start_ts"], ev["end_ts"]) == (1792454400, 1793750340)
+    assert [(t["rank_from"], t["rank_to"], t["reward"]) for t in ev["reward_tiers"]] == [(1, 1, 40), (2, 10, 10), (11, 100, 1)]
+    assert ev["leaderboard_url"].endswith("/trading-competition/season8")
+
+
+JOURNEY_PAGE = """<html><body>
+<div id=pop style="position:fixed;inset:0;background:#fff">View on Binance App
+ <button id=stay>Stay Here</button><a href="https://example.com/app">Go to App</a></div>
+<div role=tablist><button role=tab id=sub aria-selected=true>Sub Pool</button>
+<button role=tab id=main>Main Reward Pool</button></div>
+<button aria-label="Next page" id=n>Next</button>
+<script>
+let p=1, pool='sub'; const last=26;
+stay.onclick=()=>pop.remove();
+async function load(){ n.disabled=true;
+ const j=await (await fetch('/j?pool='+pool+'&p='+p)).json(); n.disabled=p>=last; }
+main.onclick=()=>{pool='main';p=1;load()};
+n.onclick=()=>{p++;load()}; load();
+</script></body></html>"""
+
+
+class JourneyFake(Fake):
+    def do_GET(self):
+        from urllib.parse import urlparse, parse_qs
+        u = urlparse(self.path)
+        if u.path == '/j':
+            q = parse_qs(u.query); p = int(q['p'][0]); pool = q['pool'][0]
+            base = 0 if pool == 'main' else 5000
+            rows = [{'rank': (p-1)*10+i, 'nickName': f'{pool}{(p-1)*10+i}', 'volume': str(base+(p-1)*10+i)} for i in range(1, 11)]
+            return self._send(json.dumps({'data': {'list': rows, 'currentPage': p, 'totalPages': 26, 'total': 260}}), 'application/json')
+        return self._send(JOURNEY_PAGE, 'text/html')
+
+
+@needs_browser
+def test_stay_here_popup_main_pool_tab_and_every_page_with_usernames(monkeypatch):
+    monkeypatch.setattr(S, 'REQUEST_DELAY_SEC', 0)
+    srv = ThreadingHTTPServer(('127.0.0.1', 0), JourneyFake)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    async def flow():
+        sc = S.Scraper(); await sc.start()
+        try:
+            res = await sc.scrape_leaderboard(f'http://127.0.0.1:{srv.server_port}/', 0)
+            assert res.pages == 26 and res.ranked_participants == 260
+            assert res.participants[0] == (1, 'main1', 1.0)
+            assert res.participants[-1] == (260, 'main260', 260.0)
+            assert [r for r, _, _ in res.participants] == list(range(1, 261))
+        finally:
+            await sc.stop()
+    try:
+        run(flow())
+    finally:
+        srv.shutdown(); srv.server_close()
+
+
+@needs_browser
+def test_stealth_context_hides_webdriver_and_uses_real_ua():
+    async def flow():
+        sc = S.Scraper(); await sc.start()
+        try:
+            ctx = await sc._new_context(); page = await ctx.new_page()
+            await page.goto("data:text/html,<p>x</p>")
+            assert await page.evaluate("navigator.webdriver") in (False, None)
+            assert "HeadlessChrome" not in await page.evaluate("navigator.userAgent")
+            assert (page.viewport_size["width"], page.viewport_size["height"]) in S.VIEWPORTS
+            await ctx.close()
+        finally:
+            await sc.stop()
+    run(flow())
