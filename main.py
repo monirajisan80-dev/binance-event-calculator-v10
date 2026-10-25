@@ -63,6 +63,7 @@ async def main(stop_event=None):
             app.add_handler(CommandHandler("start", h.start))
             app.add_handler(CommandHandler("admin", h.admin))
             app.add_handler(CommandHandler("cancel", h.cancel))
+            app.add_handler(CommandHandler("help", h.help_cmd))
             app.add_handler(CallbackQueryHandler(h.on_callback))
             app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, h.on_text))
             app.add_error_handler(h.on_error)

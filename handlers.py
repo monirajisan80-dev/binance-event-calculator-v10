@@ -23,6 +23,26 @@ async def is_admin(update: Update) -> bool:
     return bool(update.effective_user and await db.is_admin(update.effective_user.id))
 
 
+async def role_of(update: Update) -> str:
+    """Resolve the caller's live role on every interaction (never cached)."""
+    if is_owner(update):
+        return ui.ROLE_OWNER
+    if await is_admin(update):
+        return ui.ROLE_ADMIN
+    return ui.ROLE_USER
+
+
+async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data.pop("await", None)
+    role = await role_of(update)
+    await _edit_or_send(update, ui.help_text(role), ui.help_kb(role))
+
+
+async def _settings_view(update: Update, kind: str):
+    await _edit_or_send(update, f"{kind.title()}s (tap to remove):",
+                        ui.settings_kb(await db.monitoring_items(kind), kind))
+
+
 async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.pop("await", None)
     await update.effective_chat.send_message("Cancelled.")
@@ -54,17 +74,20 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.pop("await", None)
     events = await db.list_events(live_only=True)
     text = "<b>Live Binance events</b>\nTap one for details." if events else "No live events right now."
-    await _edit_or_send(update, text, ui.events_kb(events))
+    await _edit_or_send(update, text, ui.events_kb(events, role=await role_of(update)))
 
 
 async def admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.pop("await", None)
     if not await is_admin(update):
         return await update.effective_chat.send_message("⛔ Admins only.")
-    channels = await db.channels()
-    kws = await db.keywords()
-    role = "Owner" if is_owner(update) else "Admin"
-    await _edit_or_send(update, f"<b>Admin panel — {role}</b>\nChannels: {escape(', '.join(channels)) or 'none'}\nKeywords: {escape(', '.join(kws))}", ui.admin_kb(is_owner(update)))
+    owner = is_owner(update)
+    text = f"<b>Admin panel — {'Owner' if owner else 'Admin'}</b>"
+    if owner:
+        channels = await db.channels()
+        kws = await db.keywords()
+        text += f"\nChannels: {escape(', '.join(channels)) or 'none'}\nKeywords: {escape(', '.join(kws)) or 'none'}"
+    await _edit_or_send(update, text, ui.admin_kb(owner))
 
 
 async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -80,6 +103,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         if data == "home":
             return await start(update, ctx)
+        if data == "help":
+            return await help_cmd(update, ctx)
         if data.startswith("ev:"):
             ev = await db.get_event(int(data[3:]))
             if not ev:
@@ -89,7 +114,19 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         # Owner permission is checked independently of visible buttons.
         if data.startswith("o:"):
             if not is_owner(update):
-                return await q.message.reply_text("⛔ Only the bot owner can manage admins.")
+                return await q.message.reply_text("⛔ Owner only.")
+            if data in {"o:chan", "o:kw"}:
+                return await _settings_view(update, "channel" if data == "o:chan" else "keyword")
+            if data in {"o:chadd", "o:kwadd"}:
+                kind = "channel" if data == "o:chadd" else "keyword"
+                ctx.user_data["await"] = ("setting_add", kind)
+                hint = "Send a channel @username, t.me/username URL, or -100… channel ID." if kind == "channel" else "Send the new keyword (1–100 characters)."
+                return await q.message.reply_text(hint + " /cancel to cancel.")
+            if data.startswith(("o:chdel:", "o:kwdel:")):
+                _, prefix, item_id = data.split(":")
+                kind = "channel" if prefix == "chdel" else "keyword"
+                await db.remove_monitoring_item(update.effective_user.id, kind, int(item_id))
+                return await _settings_view(update, kind)
             if data == "o:admins":
                 return await manage_admins(update, ctx)
             if data == "o:add":
@@ -113,27 +150,12 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return await q.message.reply_text("⛔ Admins only. Your access may have been revoked.")
         if data == "a:home":
             return await admin(update, ctx)
-        if data in {"a:chan", "a:kw"}:
-            kind = "channel" if data == "a:chan" else "keyword"
-            return await _edit_or_send(update, f"{kind.title()}s (tap to remove):",
-                                       ui.settings_kb(await db.monitoring_items(kind), kind))
-        if data in {"a:chadd", "a:kwadd"}:
-            kind = "channel" if data == "a:chadd" else "keyword"
-            ctx.user_data["await"] = ("setting_add", kind)
-            hint = "Send a channel @username, t.me/username URL, or -100… channel ID." if kind == "channel" else "Send the new keyword (1–100 characters)."
-            return await q.message.reply_text(hint + " /cancel to cancel.")
-        if data.startswith(("chdel:", "kwdel:")):
-            prefix, item_id = data.split(":")
-            kind = "channel" if prefix == "chdel" else "keyword"
-            await db.remove_monitoring_item(update.effective_user.id, kind, int(item_id))
-            return await _edit_or_send(update, f"{kind.title()}s (tap to remove):",
-                                       ui.settings_kb(await db.monitoring_items(kind), kind))
         if data == "a:add":
             ctx.user_data["await"] = ("add",)
             return await q.message.reply_text("Send a Binance announcement link.")
         if data == "a:list":
             evs = await db.list_events()
-            return await _edit_or_send(update, "All events:" if evs else "No events.", ui.events_kb(evs))
+            return await _edit_or_send(update, "All events:" if evs else "No events.", ui.events_kb(evs, role=await role_of(update)))
         if data == "a:run":
             await q.message.reply_text("⏳ Running scrape…")
             res = await scrape_cycle()
@@ -202,8 +224,8 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     pending = ctx.user_data.pop("await", None)
     if not pending:
         return
-    if pending[0] == "admin_add" and not is_owner(update):
-        return await update.message.reply_text("⛔ Only the bot owner can manage admins.")
+    if pending[0] in ("admin_add", "setting_add") and not is_owner(update):
+        return await update.message.reply_text("⛔ Owner only.")
     if not await is_admin(update):
         return await update.message.reply_text("⛔ Admins only. Your access may have been revoked.")
     text = (update.message.text or "").strip()
@@ -219,8 +241,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             setting_kind = pending[1]
             added = await db.add_monitoring_item(update.effective_user.id, setting_kind, text)
             await update.message.reply_text("✅ Saved." if added else "Already in the list.")
-            return await _edit_or_send(update, f"{setting_kind.title()}s (tap to remove):",
-                                       ui.settings_kb(await db.monitoring_items(setting_kind), setting_kind))
+            return await _settings_view(update, setting_kind)
         if kind == "add":
             if not is_binance_url(text):
                 return await update.message.reply_text("That isn't a Binance link.")

@@ -1,5 +1,7 @@
 # Binance Event Tracker Bot
 
+> 📖 **Using the bot:** see [MANUAL.md](MANUAL.md) (also in-bot via `/help`). Regular users see events only; admins manage events; only the owner manages channels, keywords and admins.
+
 ## Setup
 Supported runtime: Python 3.11 (Docker uses the bundled Playwright runtime); the pinned Playwright 1.47 dependencies do not install cleanly on Python 3.13.
 1. Create a bot with @BotFather → `BOT_TOKEN`. Get the owner's numeric user ID from @userinfobot → required `OWNER_ID`. Do not use a bot ID or channel ID.

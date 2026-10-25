@@ -274,3 +274,20 @@ def test_legacy_database_migration_preserves_event(store):
     assert ev["title"] == "Old event"
     run(store.set_event_title(111, ev["id"], "New title"))
     assert run(store.get_event(ev["id"]))["title"] == "New title"
+
+def test_admin_cannot_use_owner_channel_keyword_controls(store):
+    run(store.add_admin(111, 222))
+    before = run(store.keywords())
+    ctx = SimpleNamespace(user_data={})
+    for data in ["o:chan", "o:kw", "o:chadd", "o:kwadd"]:
+        run(handlers.on_callback(update(222, data), ctx))
+        assert ctx.user_data == {}
+    run(handlers.on_text(update(222, text="hijack"), SimpleNamespace(user_data={"await": ("setting_add", "keyword")})))
+    assert run(store.keywords()) == before
+
+
+def test_regular_user_cannot_use_admin_actions(store):
+    ctx = SimpleNamespace(user_data={})
+    for data in ["a:home", "a:add", "a:list", "a:run"]:
+        run(handlers.on_callback(update(999, data), ctx))
+        assert ctx.user_data == {}

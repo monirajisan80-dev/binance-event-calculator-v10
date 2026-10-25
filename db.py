@@ -144,8 +144,8 @@ class DB:
         return [r["value"] for r in await self.monitoring_items("keyword")]
 
     async def add_monitoring_item(self, actor_id, kind, value):
-        if not await self.is_admin(actor_id):
-            raise PermissionError("Admins only.")
+        if actor_id != OWNER_ID:
+            raise PermissionError("Only the bot owner can manage channels and keywords.")
         if kind not in {"channel", "keyword"}:
             raise ValueError("Unknown setting.")
         value = self.normalize_channel(value) if kind == "channel" else value.strip()
@@ -153,16 +153,16 @@ class DB:
             raise ValueError("Use 1–100 characters.")
         status = await self.pool.execute("""INSERT INTO monitoring_items(kind,value,normalized)
             SELECT $1::text,$2::text,$3::text
-            WHERE $4::bigint=$5::bigint OR EXISTS(SELECT 1 FROM admins WHERE user_id=$4::bigint)
+            WHERE $4::bigint=$5::bigint
             ON CONFLICT (kind, normalized) DO NOTHING""",
             kind, value, value.casefold(), actor_id, OWNER_ID)
         return _rowcount(status) > 0
 
     async def remove_monitoring_item(self, actor_id, kind, item_id):
-        if not await self.is_admin(actor_id):
-            raise PermissionError("Admins only.")
+        if actor_id != OWNER_ID:
+            raise PermissionError("Only the bot owner can manage channels and keywords.")
         status = await self.pool.execute("""DELETE FROM monitoring_items WHERE id=$1 AND kind=$2
-            AND ($3::bigint=$4::bigint OR EXISTS(SELECT 1 FROM admins WHERE user_id=$3::bigint))""",
+            AND $3::bigint=$4::bigint""",
             int(item_id), kind, actor_id, OWNER_ID)
         return _rowcount(status) > 0
 

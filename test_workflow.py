@@ -11,12 +11,12 @@ from reward_caps import extract_reward_cap, effective_reward_cap
 from calc import user_reward, remaining_pool_stats
 from scraper import LeaderboardResult, IncompleteLeaderboard
 
-@pytest.mark.parametrize('actor', [111, 222])
+@pytest.mark.parametrize('actor', [111])
 @pytest.mark.parametrize('kind,open_button,add_button,value', [
-    ('channel','a:chan','a:chadd','@second_channel'),
-    ('keyword','a:kw','a:kwadd','New campaign'),
+    ('channel','o:chan','o:chadd','@second_channel'),
+    ('keyword','o:kw','o:kwadd','New campaign'),
 ])
-def test_admin_ui_settings_flow(store, actor, kind, open_button, add_button, value):
+def test_owner_ui_settings_flow(store, actor, kind, open_button, add_button, value):
     async def flow():
         await store.add_admin(111,222)
         ctx = SimpleNamespace(user_data={})
@@ -59,7 +59,7 @@ def test_stale_keyword_removal_does_not_delete_other_item(store):
     items=run(store.monitoring_items('keyword'))
     first=next(r for r in items if r['value']=='First')
     run(store.remove_monitoring_item(111,'keyword',first['id']))
-    run(handlers.on_callback(update(111,f"kwdel:{first['id']}"),SimpleNamespace(user_data={})))
+    run(handlers.on_callback(update(111,f"o:kwdel:{first['id']}"),SimpleNamespace(user_data={})))
     assert 'Second' in run(store.keywords())
 
 @pytest.mark.parametrize('value',['','   ','t.me/+invite','@bad/name','-123','https://example.com/channel'])
